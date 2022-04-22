@@ -1,13 +1,17 @@
 from ..models import User
-from .serializers import UserSerializer, EmailToActivateSerializer
+from .serializers import UserSerializer, EmailSerializer, ResetPasswordSerializer
 from rest_framework import generics, status, permissions
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from ..utils import account_activation_token
+from django.contrib.auth.tokens import default_token_generator
+from django.db.models.signals import post_save
+from django.dispatch import receiver
 from django.utils.http import urlsafe_base64_encode, urlsafe_base64_decode
 from django.utils.encoding import force_text, force_bytes
 from django.template.loader import render_to_string
 from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from rest_framework_simplejwt.views import TokenObtainPairView
 from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
 from django.core.mail import EmailMessage
@@ -19,7 +23,30 @@ class UserRegistration(generics.CreateAPIView):
     serializer_class = UserSerializer
 
 
+class UserProfile(generics.RetrieveAPIView):
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = UserSerializer
+    queryset = User.objects.all()
+
+
+@receiver(post_save, sender=User)
+def send_email_to_new_user(sender, instance=None, created=False, **kwargs):
+    if instance and created:
+        send_email(instance, action="activate_account")
+
+
+class MyTokenObtainPairSerializer(TokenObtainPairSerializer):
+    @classmethod
+    def get_token(cls, user):
+        token = super().get_token(user)
+
+        token['user_name'] = user.first_name
+        return token
+
+
 class MyTokenObtainPairView(TokenObtainPairView):
+    serializer_class = MyTokenObtainPairSerializer
+
     def post(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
 
@@ -28,7 +55,7 @@ class MyTokenObtainPairView(TokenObtainPairView):
         except TokenError as e:
             raise InvalidToken(e.args[0])
 
-        email = serializer.data['email']
+        email = serializer.initial_data['email']
         is_email_verified = User.objects.get(email=email).is_email_verified
 
         if not is_email_verified:
@@ -37,13 +64,13 @@ class MyTokenObtainPairView(TokenObtainPairView):
         return Response(serializer.validated_data, status=status.HTTP_200_OK)
 
 
-class EmailActivationSender(generics.GenericAPIView):
-    serializer_class = EmailToActivateSerializer
+class EmailActivationSender(generics.CreateAPIView):
+    serializer_class = EmailSerializer
 
     def post(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
         if serializer.is_valid(raise_exception=True):
-            email = serializer.data['email']
+            email = serializer.initial_data['email']
             try:
                 user = User.objects.get(email=email)
             except (TypeError, ValueError, OverflowError, User.DoesNotExist):
@@ -51,29 +78,10 @@ class EmailActivationSender(generics.GenericAPIView):
 
             if not user.is_email_verified:
                 # there needs to be checker of exceptions!!!
-                send_email_activation(user)
+                send_email(user, action="activate_account", token=account_activation_token.make_token(user))
                 return Response({'activation email was sent'}, status=status.HTTP_200_OK)
 
             return Response({"user's email have been already activated"}, status=status.HTTP_400_BAD_REQUEST)
-
-
-def send_email_activation(user):
-    user = user
-    email_subject = "Activate your account"
-    email_body = render_to_string("email_confirmation_template.html", {
-        "user_name": user.first_name,
-        "domain": "localhost:3000",
-        "uid": urlsafe_base64_encode(force_bytes(user.pk)),
-        'token': account_activation_token.make_token(user),
-    })
-
-    email_msg = EmailMessage(
-        subject=email_subject,
-        body=email_body,
-        to=(user.email, )
-    )
-
-    email_msg.send()
 
 
 class ActivateAccount(APIView):
@@ -90,10 +98,88 @@ class ActivateAccount(APIView):
             user.save()
 
             refresh = RefreshToken.for_user(user=user)
+            refresh["user_name"] = user.first_name
             tokens = {
                 'refresh': str(refresh),
                 'access': str(refresh.access_token),
             }
             return Response(tokens, status=status.HTTP_201_CREATED)
+        content = {'Something wrong with your url'}
+        return Response(content, status=status.HTTP_400_BAD_REQUEST)
+
+
+class ResetPassword(generics.CreateAPIView):
+    serializer_class = EmailSerializer
+
+    def post(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        if serializer.is_valid(raise_exception=True):
+            email = serializer.initial_data["email"]
+            try:
+                user = User.objects.get(email=email)
+            except (TypeError, ValueError, OverflowError, User.DoesNotExist):
+                return Response({'No active users with this email'}, status=status.HTTP_400_BAD_REQUEST)
+
+            if user:
+                send_email(user, action="reset_password", token=default_token_generator.make_token(user))
+                return Response({'an email with further instructions was sent'}, status=status.HTTP_200_OK)
+
+            return Response({"user's email have been already activated"}, status=status.HTTP_400_BAD_REQUEST)
+
+
+def send_email(user, action, token=None):
+    user = user
+    if action == "activate_account":
+        email_subject = "Activate your account"
+        email_template = "email_confirmation_template.html"
+    elif action == "reset_password":
+        email_subject = "Reset password"
+        email_template = "email_reset_password.html"
+    else:
+        email_subject = "Account was created"
+        email_template = "email_account_created.html"
+
+    email_body = render_to_string(email_template, {
+        "user_name": user.first_name,
+        "domain": "localhost:3000",
+        "uid": urlsafe_base64_encode(force_bytes(user.pk)),
+        'token': token
+    })
+
+    email_msg = EmailMessage(
+        subject=email_subject,
+        body=email_body,
+        to=(user.email, )
+    )
+
+    email_msg.send()
+
+
+class ResetPasswordConfirm(generics.CreateAPIView):
+    serializer_class = ResetPasswordSerializer
+
+    def post(self, request, *args, **kwargs):
+        uidb64 = self.kwargs.get("uidb64")
+        token = self.kwargs.get("token")
+        try:
+            uid = force_text(urlsafe_base64_decode(uidb64))
+            user = User.objects.get(pk=uid)
+        except (TypeError, ValueError, OverflowError, User.DoesNotExist):
+            user = None
+
+        if user is not None and default_token_generator.check_token(user, token):
+            serializer = self.get_serializer(data=request.data)
+            if serializer.is_valid(raise_exception=True):
+                password = serializer.initial_data["new_password"]
+                user.set_password(password)
+                user.save()
+
+            # refresh = RefreshToken.for_user(user=user)
+            # refresh["user_name"] = user.first_name
+            # tokens = {
+            #     'refresh': str(refresh),
+            #     'access': str(refresh.access_token),
+            # }
+            return Response({'Password was changed'}, status=status.HTTP_201_CREATED)
         content = {'Something wrong with your url'}
         return Response(content, status=status.HTTP_400_BAD_REQUEST)

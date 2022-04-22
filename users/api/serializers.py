@@ -2,6 +2,16 @@ from rest_framework import serializers
 from users.models import User
 
 
+class PasswordField(serializers.CharField):
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("style", {})
+
+        kwargs["style"]["input_type"] = "password"
+        kwargs["write_only"] = True
+
+        super().__init__()
+
+
 class UserSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
@@ -16,5 +26,10 @@ class UserSerializer(serializers.ModelSerializer):
         return user
 
 
-class EmailToActivateSerializer(serializers.Serializer):
+class EmailSerializer(serializers.Serializer):
     email = serializers.EmailField()
+
+
+class ResetPasswordSerializer(serializers.Serializer):
+    new_password = PasswordField()
+    confirm_password = PasswordField()
