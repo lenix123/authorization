@@ -15,6 +15,7 @@ from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from rest_framework_simplejwt.views import TokenObtainPairView
 from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
 from django.core.mail import EmailMessage
+import threading
 
 
 class UserRegistration(generics.CreateAPIView):
@@ -77,7 +78,7 @@ class EmailActivationSender(generics.CreateAPIView):
                 return Response({'user with this email is not found'}, status=status.HTTP_400_BAD_REQUEST)
 
             if not user.is_email_verified:
-                # there needs to be checker of exceptions!!!
+                # TODO there needs to be checker of exceptions
                 send_email(user, action="activate_account", token=account_activation_token.make_token(user))
                 return Response({'activation email was sent'}, status=status.HTTP_200_OK)
 
@@ -115,26 +116,24 @@ class ResetPassword(generics.CreateAPIView):
         serializer = self.get_serializer(data=request.data)
         if serializer.is_valid(raise_exception=True):
             email = serializer.initial_data["email"]
-            try:
-                user = User.objects.get(email=email)
-            except (TypeError, ValueError, OverflowError, User.DoesNotExist):
-                return Response({'No active users with this email'}, status=status.HTTP_400_BAD_REQUEST)
-
-            if user:
-                send_email(user, action="reset_password", token=default_token_generator.make_token(user))
-                return Response({'an email with further instructions was sent'}, status=status.HTTP_200_OK)
-
-            return Response({"user's email have been already activated"}, status=status.HTTP_400_BAD_REQUEST)
+            message = {'If an account exists you will get an email with instructions on resetting your password'}
+            send_email(email, action="reset_password")
+            return Response(message, status=status.HTTP_200_OK)
 
 
-def send_email(user, action, token=None):
-    user = user
+def send_email(email, action, token=None):
+    try:
+        user = User.objects.get(email=email)
+    except (TypeError, ValueError, OverflowError, User.DoesNotExist):
+        return None
+
     if action == "activate_account":
         email_subject = "Activate your account"
         email_template = "email_confirmation_template.html"
     elif action == "reset_password":
         email_subject = "Reset password"
         email_template = "email_reset_password.html"
+        token = default_token_generator.make_token(user)
     else:
         email_subject = "Account was created"
         email_template = "email_account_created.html"
@@ -146,13 +145,20 @@ def send_email(user, action, token=None):
         'token': token
     })
 
-    email_msg = EmailMessage(
-        subject=email_subject,
-        body=email_body,
-        to=(user.email, )
-    )
+    # async sending an email
+    EmailThread(email_subject, email_body, (user.email, )).start()
 
-    email_msg.send()
+
+class EmailThread(threading.Thread):
+    def __init__(self, subject, body, to):
+        self.subject = subject
+        self.to = to
+        self.body = body
+        threading.Thread.__init__(self)
+
+    def run(self):
+        msg = EmailMessage(subject=self.subject, body=self.body, to=self.to)
+        msg.send()
 
 
 class ResetPasswordConfirm(generics.CreateAPIView):
