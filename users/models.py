@@ -27,13 +27,18 @@ class UserManager(BaseUserManager):
 
 class User(AbstractBaseUser):
     username = None
-    email = models.EmailField("Email address", unique=True)
+    email = models.EmailField("Email Address", unique=True)
+    recovery_email = models.EmailField("Recovery Email Address", blank=True)
     first_name = models.CharField("First Name", max_length=50)
     last_name = models.CharField("Last Name", max_length=50)
     is_active = models.BooleanField(default=True)
     is_admin = models.BooleanField(default=False)
     is_staff = models.BooleanField(default=False)
     is_email_verified = models.BooleanField(default=False)
+    is_recovery_email_verified = models.BooleanField(default=False)
+    email_to_change = models.EmailField("Email To Change", blank=True)
+    is_two_fac_auth_enabled = models.BooleanField(default=False)
+    otp_secret = models.CharField(max_length=16, default="", blank=True)
 
     objects = UserManager()
 

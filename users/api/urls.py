@@ -1,15 +1,20 @@
 from django.urls import path
-from .views import UserRegistration, MyTokenObtainPairView, EmailActivationSender, UserProfile, ActivateAccount,\
-    ResetPassword, ResetPasswordConfirm
+from .views import *
 from rest_framework_simplejwt.views import (
     TokenRefreshView,
 )
 
 urlpatterns = [
     path('signup/', UserRegistration.as_view(), name='registration'),
-    path('token/', MyTokenObtainPairView.as_view(), name='token_obtain_pair'),
+    path('signin/', MyTokenObtainPairView.as_view(), name='token_obtain_pair'),
     path('token/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
     path('send_confirm_email/', EmailActivationSender.as_view(), name='email_confirm_sender'),
+    path('change_email/<int:pk>/', ChangeUserEmail.as_view(), name='change_email'),
+    path('set_recovery_email/<int:pk>/', SetRecoveryEmail.as_view(), name='set_recovery_email'),
+    path('activate_recovery_email/<str:uidb64>/<str:token>/', ActivateRecoveryEmail.as_view()),
+    path('change_password/<int:pk>/', ChangePassword.as_view(), name='change_password'),
+    path('enable_two_factor_auth/<int:pk>/', EnableTwoFacAuth.as_view(), name='enable_two_factor_auth'),
+    path('verify_two_factor_code/<int:pk>/', VerifyTwoFactorCode.as_view(), name='verify_two_factor_code'),
     path('user_profile/<int:pk>/', UserProfile.as_view(), name='user_profile'),
     path('accounts/activate/<str:uidb64>/<str:token>/', ActivateAccount.as_view(), name='activate'),
     path('accounts/password_reset/', ResetPassword.as_view(), name='reset_password'),

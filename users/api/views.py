@@ -1,5 +1,8 @@
+import pyotp
+
 from ..models import User
-from .serializers import UserSerializer, EmailSerializer, ResetPasswordSerializer
+from .serializers import UserSerializer, EmailSerializer, ResetPasswordSerializer, ChangeEmailSerializer, \
+    ChangePasswordSerializer, MyTokenObtainPairSerializer, ConfirmAccessSerializer, TwoFactorCodeSerializer
 from rest_framework import generics, status, permissions
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -11,11 +14,18 @@ from django.utils.http import urlsafe_base64_encode, urlsafe_base64_decode
 from django.utils.encoding import force_text, force_bytes
 from django.template.loader import render_to_string
 from rest_framework_simplejwt.tokens import RefreshToken
-from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from rest_framework_simplejwt.views import TokenObtainPairView
 from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
 from django.core.mail import EmailMessage
 import threading
+
+
+def retrieve_user(uidb64):
+    try:
+        uid = force_text(urlsafe_base64_decode(uidb64))
+        return User.objects.get(pk=uid)
+    except (TypeError, ValueError, OverflowError, User.DoesNotExist):
+        return None
 
 
 class UserRegistration(generics.CreateAPIView):
@@ -24,25 +34,16 @@ class UserRegistration(generics.CreateAPIView):
     serializer_class = UserSerializer
 
 
-class UserProfile(generics.RetrieveAPIView):
+class UserProfile(generics.RetrieveUpdateDestroyAPIView):
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = UserSerializer
     queryset = User.objects.all()
 
 
 @receiver(post_save, sender=User)
-def send_email_to_new_user(sender, instance=None, created=False, **kwargs):
+def send_email_to_new_user(instance=None, created=False, **kwargs):
     if instance and created:
         send_email(instance, action="activate_account")
-
-
-class MyTokenObtainPairSerializer(TokenObtainPairSerializer):
-    @classmethod
-    def get_token(cls, user):
-        token = super().get_token(user)
-
-        token['user_name'] = user.first_name
-        return token
 
 
 class MyTokenObtainPairView(TokenObtainPairView):
@@ -56,11 +57,8 @@ class MyTokenObtainPairView(TokenObtainPairView):
         except TokenError as e:
             raise InvalidToken(e.args[0])
 
-        email = serializer.initial_data['email']
-        is_email_verified = User.objects.get(email=email).is_email_verified
-
-        if not is_email_verified:
-            return Response({'email address is not confirmed'}, status=status.HTTP_403_FORBIDDEN)
+        # if serializer.validated_data["two_fac_auth"]:
+        #     email = serializer.initial_data['email']
 
         return Response(serializer.validated_data, status=status.HTTP_200_OK)
 
@@ -79,7 +77,7 @@ class EmailActivationSender(generics.CreateAPIView):
 
             if not user.is_email_verified:
                 # TODO there needs to be checker of exceptions
-                send_email(user, action="activate_account", token=account_activation_token.make_token(user))
+                send_email(user, action="activate_account")
                 return Response({'activation email was sent'}, status=status.HTTP_200_OK)
 
             return Response({"user's email have been already activated"}, status=status.HTTP_400_BAD_REQUEST)
@@ -89,12 +87,15 @@ class ActivateAccount(APIView):
     permission_classes = [permissions.AllowAny]
 
     def get(self, request, uidb64, token, format=None):
-        try:
-            uid = force_text(urlsafe_base64_decode(uidb64))
-            user = User.objects.get(pk=uid)
-        except (TypeError, ValueError, OverflowError, User.DoesNotExist):
-            user = None
+        user = retrieve_user(uidb64)
         if user is not None and account_activation_token.check_token(user, token):
+            new_email = user.email_to_change
+            if new_email and not User.objects.filter(email=new_email).exists():
+                user.email = new_email
+                user.email_to_change = ""
+            else:
+                send_email(user, "created_account")
+
             user.is_email_verified = True
             user.save()
 
@@ -117,22 +118,30 @@ class ResetPassword(generics.CreateAPIView):
         if serializer.is_valid(raise_exception=True):
             email = serializer.initial_data["email"]
             message = {'If an account exists you will get an email with instructions on resetting your password'}
-            send_email(email, action="reset_password")
+            try:
+                user = User.objects.get(email=email)
+            except (TypeError, ValueError, OverflowError, User.DoesNotExist):
+                return Response(message, status=status.HTTP_200_OK)
+
+            send_email(user, action="reset_password")
             return Response(message, status=status.HTTP_200_OK)
 
 
-def send_email(email, action, token=None):
-    try:
-        user = User.objects.get(email=email)
-    except (TypeError, ValueError, OverflowError, User.DoesNotExist):
-        return None
-
+def send_email(user, action, token=None, email=None):
     if action == "activate_account":
         email_subject = "Activate your account"
         email_template = "email_confirmation_template.html"
+        token = account_activation_token.make_token(user)
     elif action == "reset_password":
         email_subject = "Reset password"
         email_template = "email_reset_password.html"
+        token = default_token_generator.make_token(user)
+    elif action == "reset_password_notification":
+        email_subject = "Security notification"
+        email_template = "email_reset_pass_notification.html"
+    elif action == "set_recovery_email":
+        email_subject = "Set recovery email"
+        email_template = "email_set_recovery_email.html"
         token = default_token_generator.make_token(user)
     else:
         email_subject = "Account was created"
@@ -145,8 +154,10 @@ def send_email(email, action, token=None):
         'token': token
     })
 
+    to = email if email else user.email
+
     # async sending an email
-    EmailThread(email_subject, email_body, (user.email, )).start()
+    EmailThread(email_subject, email_body, (to, )).start()
 
 
 class EmailThread(threading.Thread):
@@ -166,13 +177,9 @@ class ResetPasswordConfirm(generics.CreateAPIView):
 
     def post(self, request, *args, **kwargs):
         uidb64 = self.kwargs.get("uidb64")
-        token = self.kwargs.get("token")
-        try:
-            uid = force_text(urlsafe_base64_decode(uidb64))
-            user = User.objects.get(pk=uid)
-        except (TypeError, ValueError, OverflowError, User.DoesNotExist):
-            user = None
+        user = retrieve_user(uidb64)
 
+        token = self.kwargs.get("token")
         if user is not None and default_token_generator.check_token(user, token):
             serializer = self.get_serializer(data=request.data)
             if serializer.is_valid(raise_exception=True):
@@ -180,12 +187,156 @@ class ResetPasswordConfirm(generics.CreateAPIView):
                 user.set_password(password)
                 user.save()
 
-            # refresh = RefreshToken.for_user(user=user)
-            # refresh["user_name"] = user.first_name
-            # tokens = {
-            #     'refresh': str(refresh),
-            #     'access': str(refresh.access_token),
-            # }
-            return Response({'Password was changed'}, status=status.HTTP_201_CREATED)
+                send_email(user, 'reset_password_notification')
+                return Response({'Password was changed'}, status=status.HTTP_201_CREATED)
+
         content = {'Something wrong with your url'}
         return Response(content, status=status.HTTP_400_BAD_REQUEST)
+
+
+class ChangeUserEmail(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, *args, **kwargs):
+        serializer = ChangeEmailSerializer(data=request.data)
+        if serializer.is_valid(raise_exception=True):
+            pk = self.kwargs.get("pk")
+            try:
+                user = User.objects.get(pk=pk)
+            except User.DoesNotExist:
+                return Response({'detail': 'User is not found'}, status=status.HTTP_400_BAD_REQUEST)
+
+            if user.check_password(serializer.initial_data["password"]):
+                new_email = serializer.initial_data["new_email"]
+                if User.objects.filter(email=new_email).exists():
+                    return Response({'detail': 'Email address already in use'}, status=status.HTTP_400_BAD_REQUEST)
+
+                user.email_to_change = new_email
+                user.save()
+                send_email(user, action="activate_account", email=new_email)
+                return Response({'detail': 'Check your email box'}, status=status.HTTP_200_OK)
+
+            return Response({'detail': 'Invalid credentials'}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class SetRecoveryEmail(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def patch(self, request, *args, **kwargs):
+        serializer = EmailSerializer(data=request.data)
+        if serializer.is_valid(raise_exception=True):
+            uid = self.kwargs.get("pk")
+            try:
+                user = User.objects.get(pk=uid)
+            except User.DoesNotExist:
+                return Response({'detail': 'User is not found'}, status=status.HTTP_400_BAD_REQUEST)
+
+            user.recovery_email = serializer.initial_data["email"]
+            user.is_recovery_email_verified = False
+            user.save()
+            user_serializer = UserSerializer(user)
+            send_email(user, action="set_recovery_email", email=user.recovery_email)
+            return Response(user_serializer.data, status=status.HTTP_200_OK)
+
+
+class ActivateRecoveryEmail(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        uidb64 = self.kwargs.get("uidb64")
+        user = retrieve_user(uidb64)
+
+        token = self.kwargs.get("token")
+        if user is not None and default_token_generator.check_token(user, token):
+            user.is_recovery_email_verified = True
+            user.save()
+            return Response({'detail': 'Recovery email was set'}, status=status.HTTP_201_CREATED)
+
+        return Response({'detail': 'Something wrong with your url'}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class ChangePassword(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, *args, **kwargs):
+        serializer = ChangePasswordSerializer(data=request.data)
+        if serializer.is_valid(raise_exception=True):
+            uid = self.kwargs.get("pk")
+
+            try:
+                user = User.objects.get(pk=uid)
+            except User.DoesNotExist:
+                return Response({'detail': 'User is not found'}, status=status.HTTP_400_BAD_REQUEST)
+
+            new_password = serializer.initial_data["new_password"]
+            if not user.check_password(serializer.initial_data["old_password"]):
+                return Response({'detail': 'Invalid credentials'}, status=status.HTTP_400_BAD_REQUEST)
+
+            if new_password != serializer.initial_data["confirm_new_password"]:
+                return Response({'detail': 'The passwords mismatch'}, status=status.HTTP_400_BAD_REQUEST)
+
+            user.set_password(new_password)
+            user.save()
+            return Response({'Password was changed'}, status=status.HTTP_200_OK)
+
+
+class EnableTwoFacAuth(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, *args, **kwargs):
+        serializer = ConfirmAccessSerializer(data=request.data)
+        if serializer.is_valid(raise_exception=True):
+            uid = self.kwargs.get("pk")
+
+            try:
+                user = User.objects.get(pk=uid)
+            except User.DoesNotExist:
+                return Response({'detail': 'User is not found'}, status=status.HTTP_400_BAD_REQUEST)
+
+            password = serializer.initial_data["password"]
+            if not user.check_password(password):
+                return Response({'detail': 'Invalid credentials'}, status=status.HTTP_400_BAD_REQUEST)
+
+            user.otp_secret = pyotp.random_base32()
+            user.save()
+
+            secret_url = self.get_secret_url(user)
+            return Response(secret_url, status=status.HTTP_200_OK)
+
+    def get_secret_url(self, user):
+        otp_secret = user.otp_secret
+
+        secret_url = ''
+        if otp_secret:
+            secret_url = pyotp.TOTP(otp_secret).provisioning_uri(user.first_name, issuer_name="Lenix")
+        return secret_url
+
+
+class VerifyTwoFactorCode(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, *args, **kwargs):
+        serializer = TwoFactorCodeSerializer(data=request.data)
+        if serializer.is_valid(raise_exception=True):
+            uid = self.kwargs.get("pk")
+
+            try:
+                user = User.objects.get(pk=uid)
+            except User.DoesNotExist:
+                return Response({'detail': 'User is not found'}, status=status.HTTP_400_BAD_REQUEST)
+
+            code = serializer.initial_data["code"]
+            if not user.otp_secret:
+                return Response({'detail': '2FA not enabled for this user. Please try again.'},
+                                status=status.HTTP_400_BAD_REQUEST)
+
+            totp = pyotp.TOTP(user.otp_secret)
+            token_valid = totp.verify(code, valid_window=2)
+            if not token_valid:
+                return Response({'detail': 'Invalid two-factor authentication token. Please try again.'},
+                                status=status.HTTP_400_BAD_REQUEST)
+
+            if not user.is_two_fac_auth_enabled:
+                user.is_two_fac_auth_enabled = True
+
+            return Response('The code is verified', status=status.HTTP_200_OK)
