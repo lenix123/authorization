@@ -32,10 +32,10 @@ class MyTokenObtainPairSerializer(TokenObtainSerializer):
         if not self.user.is_email_verified:
             raise exceptions.PermissionDenied("email address is not verified")
 
-        if self.user.is_two_fac_auth_enabled:
-            return {"two_fac_auth": True}
-
         refresh = self.get_token(self.user)
+
+        if self.user.is_two_fac_auth_enabled:
+            return {"two_fac_access_token": str(refresh.access_token)}
 
         data["refresh"] = str(refresh)
         data["access"] = str(refresh.access_token)
@@ -86,4 +86,4 @@ class ConfirmAccessSerializer(serializers.Serializer):
 
 
 class TwoFactorCodeSerializer(serializers.Serializer):
-    code = serializers.IntegerField(max_value=999999, min_value=100000)
+    code = serializers.CharField(max_length=6)

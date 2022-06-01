@@ -38,7 +38,7 @@ class User(AbstractBaseUser):
     is_recovery_email_verified = models.BooleanField(default=False)
     email_to_change = models.EmailField("Email To Change", blank=True)
     is_two_fac_auth_enabled = models.BooleanField(default=False)
-    otp_secret = models.CharField(max_length=16, default="", blank=True)
+    otp_secret = models.CharField(max_length=32, default="", blank=True)
 
     objects = UserManager()
 

@@ -20,6 +20,16 @@ from django.core.mail import EmailMessage
 import threading
 
 
+def get_tokens_for_user(user):
+    refresh = RefreshToken.for_user(user)
+    refresh['user_name'] = user.first_name
+
+    return {
+        'refresh': str(refresh),
+        'access': str(refresh.access_token),
+    }
+
+
 def retrieve_user(uidb64):
     try:
         uid = force_text(urlsafe_base64_decode(uidb64))
@@ -57,8 +67,9 @@ class MyTokenObtainPairView(TokenObtainPairView):
         except TokenError as e:
             raise InvalidToken(e.args[0])
 
-        # if serializer.validated_data["two_fac_auth"]:
-        #     email = serializer.initial_data['email']
+        two_fac_access_token = serializer.validated_data["two_fac_access_token"]
+        if two_fac_access_token:
+            return Response({"two_factor_access_token": two_fac_access_token}, status=status.HTTP_202_ACCEPTED)
 
         return Response(serializer.validated_data, status=status.HTTP_200_OK)
 
@@ -99,13 +110,9 @@ class ActivateAccount(APIView):
             user.is_email_verified = True
             user.save()
 
-            refresh = RefreshToken.for_user(user=user)
-            refresh["user_name"] = user.first_name
-            tokens = {
-                'refresh': str(refresh),
-                'access': str(refresh.access_token),
-            }
+            tokens = get_tokens_for_user(user)
             return Response(tokens, status=status.HTTP_201_CREATED)
+
         content = {'Something wrong with your url'}
         return Response(content, status=status.HTTP_400_BAD_REQUEST)
 
@@ -157,7 +164,7 @@ def send_email(user, action, token=None, email=None):
     to = email if email else user.email
 
     # async sending an email
-    EmailThread(email_subject, email_body, (to, )).start()
+    EmailThread(email_subject, email_body, (to,)).start()
 
 
 class EmailThread(threading.Thread):
@@ -297,11 +304,15 @@ class EnableTwoFacAuth(APIView):
             if not user.check_password(password):
                 return Response({'detail': 'Invalid credentials'}, status=status.HTTP_400_BAD_REQUEST)
 
+            if user.is_two_fac_auth_enabled:
+                return Response({'detail': 'The user have already enabled two-factor authentication'},
+                                status=status.HTTP_400_BAD_REQUEST)
+
             user.otp_secret = pyotp.random_base32()
             user.save()
 
             secret_url = self.get_secret_url(user)
-            return Response(secret_url, status=status.HTTP_200_OK)
+            return Response({'secret_url': secret_url, 'otp_secret': user.otp_secret}, status=status.HTTP_200_OK)
 
     def get_secret_url(self, user):
         otp_secret = user.otp_secret
@@ -318,12 +329,10 @@ class VerifyTwoFactorCode(APIView):
     def post(self, request, *args, **kwargs):
         serializer = TwoFactorCodeSerializer(data=request.data)
         if serializer.is_valid(raise_exception=True):
-            uid = self.kwargs.get("pk")
+            user = request.user
 
-            try:
-                user = User.objects.get(pk=uid)
-            except User.DoesNotExist:
-                return Response({'detail': 'User is not found'}, status=status.HTTP_400_BAD_REQUEST)
+            if not user:
+                return Response({'detail': 'User is not found'}, status=status.HTTP_401_UNAUTHORIZED)
 
             code = serializer.initial_data["code"]
             if not user.otp_secret:
@@ -338,5 +347,23 @@ class VerifyTwoFactorCode(APIView):
 
             if not user.is_two_fac_auth_enabled:
                 user.is_two_fac_auth_enabled = True
+                user.save()
 
-            return Response('The code is verified', status=status.HTTP_200_OK)
+            tokens = get_tokens_for_user(user)
+            return Response(tokens, status=status.HTTP_200_OK)
+
+
+class DisableTwoFactorAuth(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        user = request.user
+
+        if not user:
+            return Response({'detail': 'User is not found'}, status=status.HTTP_401_UNAUTHORIZED)
+
+        user.is_two_fac_auth_enabled = False
+        user.otp_secret = ""
+        user.save()
+        user_serializer = UserSerializer(user)
+        return Response(user_serializer.data, status=status.HTTP_200_OK)
